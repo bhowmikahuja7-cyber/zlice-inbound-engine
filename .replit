@@ -21,6 +21,10 @@ path = "scripts/post-merge.sh"
 timeoutMs = 20000
 
 [[ports]]
+localPort = 3000
+externalPort = 3000
+
+[[ports]]
 localPort = 8080
 externalPort = 8080
 
@@ -40,3 +44,6 @@ OPTION_ID_DONE = "98236657"
 GITHUB_TOKEN = "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"
 DISCORD_BOT_TOKEN = "MTUwMTUxMTk0Njk1NTAwMTg5Ng.G4nElf.C5FKM_8tleqIGhX_U-W73ZjgHWYXqECKFV5p3U"
 OPTION_ID_REVIEW_FOUNDER = "df73e18b"
+
+[nix]
+packages = ["psmisc"]
