@@ -10,11 +10,19 @@ const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const REPO_OWNER = process.env.GITHUB_OWNER;
 const REPO_NAME = process.env.GITHUB_REPO;
 
-// Helper for GitHub GraphQL calls
+// Helper for GitHub GraphQL calls with Error Catching
 async function queryGitHub(query, variables) {
-  return axios.post('https://api.github.com/graphql', { query, variables }, {
-    headers: { Authorization: `Bearer ${GITHUB_TOKEN}` }
+  const response = await axios.post('https://api.github.com/graphql', { query, variables }, {
+    headers: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` }
   });
+
+  // If GraphQL returns an error array, force the catch block to trigger
+  if (response.data.errors) {
+    console.error("🚨 GRAPHQL ERROR:", JSON.stringify(response.data.errors, null, 2));
+    throw new Error("GitHub rejected the GraphQL request.");
+  }
+
+  return response;
 }
 
 client.on('messageCreate', async (message) => {
@@ -54,14 +62,28 @@ client.on('messageCreate', async (message) => {
       }`;
 
     const itemData = await queryGitHub(findItemQuery, { owner: REPO_OWNER, repo: REPO_NAME, pr: prNumber });
-    const projectItem = itemData.data.data.repository.pullRequest.projectItems.nodes[0];
 
-    if (projectItem) {
-      // Map labels to your Column Option IDs (You will set these in Replit Secrets)
+    // Check if the card actually exists on the board before trying to move it
+    if (itemData.data.data.repository.pullRequest.projectItems.nodes.length > 0) {
+      const projectItem = itemData.data.data.repository.pullRequest.projectItems.nodes[0];
+
+      // Map labels to your Column Option IDs
       let targetOptionId = "";
-      if (labelInput.includes("bug")) targetOptionId = process.env.OPTION_ID_TODO;
-      if (labelInput.includes("weekday")) targetOptionId = process.env.OPTION_ID_REVIEW;
-      if (labelInput.includes("weekend")) targetOptionId = process.env.OPTION_ID_DONE;
+
+      // Exact match for the Founders review trigger
+      if (labelInput.includes("done review (weekday)")) {
+        targetOptionId = process.env.OPTION_ID_REVIEW_FOUNDER;
+      } 
+      // Fallbacks for your other labels
+      else if (labelInput.includes("bug")) {
+        targetOptionId = process.env.OPTION_ID_TODO;
+      } 
+      else if (labelInput.includes("weekday")) {
+        targetOptionId = process.env.OPTION_ID_REVIEW; 
+      } 
+      else if (labelInput.includes("weekend")) {
+        targetOptionId = process.env.OPTION_ID_DONE;
+      }
 
       if (targetOptionId) {
         const moveMutation = `
