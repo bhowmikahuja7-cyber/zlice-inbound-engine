@@ -23,7 +23,7 @@ async function queryGitHub(query, variables) {
 }
 
 // --- FEATURE 1: AUTOMATED CHANNEL CREATION (Incoming from GitHub) ---
-app.post('/webhook', async (req, res) => {
+app.post('/api/webhook', async (req, res) => {
   const event = req.headers['x-github-event'];
   const action = req.body.action;
 
@@ -135,5 +135,6 @@ client.on('messageCreate', async (message) => {
 });
 
 client.login(process.env.DISCORD_BOT_TOKEN);
-app.get('/', (req, res) => res.send('Zlice Engine & Webhook Listener Online'));
-app.listen(3000, () => console.log('Listening for Webhooks on Port 3000...'));
+app.get('/api', (req, res) => res.send('Zlice Engine & Webhook Listener Online'));
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`Listening for Webhooks on Port ${PORT}...`));
