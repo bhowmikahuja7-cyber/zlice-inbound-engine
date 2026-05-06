@@ -91,6 +91,7 @@ client.on('messageCreate', async (message) => {
   }
 });
 
+console.log("My token is:", process.env.DISCORD_BOT_TOKEN ? "LOADED" : "MISSING");
 client.login(process.env.DISCORD_BOT_TOKEN);
 const app = express();
 app.get('/', (req, res) => res.send('Zlice Engine Online'));
