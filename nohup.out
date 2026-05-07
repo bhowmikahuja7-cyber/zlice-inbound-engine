@@ -2,3 +2,29 @@ Listening for Webhooks on Port 8080...
 Listening for Webhooks on Port 8080...
 Listening for Webhooks on Port 8080...
 Listening for Webhooks on Port 8080...
+
+🚀 --- NEW ENGINE SYNC STARTED --- 🚀
+📌 PR Number: 24 | Label Detected: "bug"
+
+🚀 --- NEW ENGINE SYNC STARTED --- 🚀
+📌 PR Number: 24 | Label Detected: "bug"
+🎯 Found linked Issue on Board: "@bhowmikahuja7-cyber's untitled project"
+🎯 Found linked Issue on Board: "@bhowmikahuja7-cyber's untitled project"
+✅ GitHub Mutation Response: {
+  "updateProjectV2ItemFieldValue": {
+    "projectV2Item": {
+      "id": "PVTI_lAHODa11S84BW2mQzgsCJs4"
+    }
+  }
+}
+🏁 --- SYNC FINISHED ---
+
+✅ GitHub Mutation Response: {
+  "updateProjectV2ItemFieldValue": {
+    "projectV2Item": {
+      "id": "PVTI_lAHODa11S84BW2mQzgsCJs4"
+    }
+  }
+}
+🏁 --- SYNC FINISHED ---
+
