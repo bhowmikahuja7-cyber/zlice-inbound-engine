@@ -171,5 +171,8 @@ client.on('messageCreate', async (message) => {
 });
 
 client.login(process.env.DISCORD_BOT_TOKEN);
-app.get('/', (req, res) => res.send('Zlice Engine & Webhook Listener Online'));
+// This handles both the base link and the /api link
+app.get(['/', '/api'], (req, res) => {
+  res.send('Zlice Engine & Webhook Listener Online');
+});
 app.listen(8080, () => console.log('Listening for Webhooks on Port 8080...'));
