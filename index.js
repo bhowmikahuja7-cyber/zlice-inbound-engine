@@ -22,16 +22,18 @@ async function queryGitHub(query, variables) {
   return response;
 }
 
-// --- FEATURE 1: AUTOMATED CHANNEL CREATION ---
+// --- FEATURE 1: AUTOMATED CHANNEL CREATION (DYNAMIC REPO) ---
 app.post('/webhook', async (req, res) => {
   const event = req.headers['x-github-event'];
   const action = req.body.action;
 
   if (event === 'pull_request' && action === 'opened') {
     const pr = req.body.pull_request;
+    const repoName = req.body.repository.name; // Dynamically pulls from any of the 10 repos
     const prNumber = pr.number;
-    const prTitle = pr.title.toLowerCase().replace(/\s+/g, '-');
-    const channelName = `${prNumber}-${prTitle}`;
+    
+    // Discord channel format: #repo-name-prnumber (e.g., #zlice-kitchen-15)
+    const channelName = `${repoName}-${prNumber}`.toLowerCase(); 
 
     try {
       const guild = client.guilds.cache.first(); 
@@ -40,11 +42,11 @@ app.post('/webhook', async (req, res) => {
       const newChannel = await guild.channels.create({
         name: channelName,
         type: ChannelType.GuildText,
-        topic: `Discussion for PR #${prNumber}: ${pr.html_url}`,
+        topic: `Discussion for PR #${prNumber} in ${repoName}: ${pr.html_url}`,
       });
 
       console.log(`🚀 Automated Channel Created: #${channelName}`);
-      newChannel.send(`🚀 **New PR Raised:** #${prNumber}\n**Title:** ${pr.title}\n**Link:** ${pr.html_url}\n\nUse \`Description -> ...\` and \`Label -> ...\` here to sync with the board.`);
+      newChannel.send(`🚀 **New PR Raised in \`${repoName}\`:** #${prNumber}\n**Title:** ${pr.title}\n**Link:** ${pr.html_url}\n\nUse \`Description -> ...\` and \`Label -> ...\` here to sync with the board.`);
     } catch (err) {
       console.error("❌ Failed to create channel:", err);
     }
@@ -52,7 +54,7 @@ app.post('/webhook', async (req, res) => {
   res.status(200).send('OK');
 });
 
-// --- FEATURE 2: BOARD SYNC LOGIC (UPGRADED PARSER & X-RAY VISION) ---
+// --- FEATURE 2: BOARD SYNC LOGIC (DYNAMIC REPO ROUTING) ---
 client.on('messageCreate', async (message) => {
   // Trigger if the message contains "Label ->" or "Labels ->" (case insensitive)
   if (message.author.bot || !/Labels?\s*->/i.test(message.content)) return;
@@ -70,27 +72,28 @@ client.on('messageCreate', async (message) => {
     // 2. Extract the Description
     const descMatch = message.content.match(/Description\s*->\s*([\s\S]*?)(?=Labels?\s*->)/i);
     if (descMatch) {
-      // Grab everything between "Description ->" and "Label ->"
       description = descMatch[1].trim();
     } else {
-      // Fallback: If they forget "Description ->", grab everything above the Label
       const parts = message.content.split(/Labels?\s*->/i);
       description = parts[0].trim();
     }
 
-    const prMatch = message.channel.name.match(/^\d+/);
-    if (!prMatch) return message.reply("❌ No PR number in channel name.");
-    const prNumber = parseInt(prMatch[0]);
+    // Extract dynamic Repo Name and PR Number from the channel name
+    const channelParts = message.channel.name.split('-');
+    const prNumber = parseInt(channelParts.pop()); 
+    const repoName = channelParts.join('-'); 
 
-    console.log(`📌 PR Number: ${prNumber} | Label Detected: "${labelInput}"`);
+    if (!prNumber || !repoName) return message.reply("❌ Cannot identify PR number or Repo from channel name.");
 
-    // 3. REST API: Comments & Labels
-    const restBase = `https://api.github.com/repos/${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}/issues/${prNumber}`;
+    console.log(`📌 Target Repo: ${repoName} | PR: ${prNumber} | Label: "${labelInput}"`);
+
+    // 3. REST API: Dynamic Repo Target
+    const restBase = `https://api.github.com/repos/${process.env.GITHUB_OWNER}/${repoName}/issues/${prNumber}`;
     const restHeaders = { headers: { Authorization: `token ${process.env.GITHUB_TOKEN}` } };
     await axios.post(`${restBase}/comments`, { body: `**Zlice Engine Update:**\n\n${description}` }, restHeaders);
     await axios.post(`${restBase}/labels`, { labels: [labelInput] }, restHeaders);
 
-    // 4. GraphQL API: Board Movement (X-Ray Vision)
+    // 4. GraphQL API: Dynamic Repo Target
     const findItemQuery = `
       query($owner: String!, $repo: String!, $pr: Int!) {
         repository(owner: $owner, name: $repo) {
@@ -109,17 +112,15 @@ client.on('messageCreate', async (message) => {
         }
       }`;
 
-    const itemData = await queryGitHub(findItemQuery, { owner: process.env.GITHUB_OWNER, repo: process.env.GITHUB_REPO, pr: prNumber });
+    const itemData = await queryGitHub(findItemQuery, { owner: process.env.GITHUB_OWNER, repo: repoName, pr: prNumber });
     const prData = itemData.data.data.repository.pullRequest;
 
     let projectItem = null;
 
-    // A. Check if the PR itself is physically on the board
     if (prData.projectItems.nodes && prData.projectItems.nodes.length > 0) {
       projectItem = prData.projectItems.nodes[0];
       console.log(`🎯 Found PR directly on Board: "${projectItem.project.title}"`);
     } 
-    // B. Check if the PR is linked to an ISSUE that is on the board
     else if (prData.closingIssuesReferences.nodes && prData.closingIssuesReferences.nodes.length > 0) {
       for (const issue of prData.closingIssuesReferences.nodes) {
         if (issue.projectItems.nodes && issue.projectItems.nodes.length > 0) {
@@ -133,6 +134,7 @@ client.on('messageCreate', async (message) => {
     if (projectItem) {
       let targetOptionId = "";
 
+      // Maps Discord labels to GitHub Project column IDs
       if (labelInput.includes("done review (weekday)")) targetOptionId = process.env.OPTION_ID_REVIEW_FOUNDER;
       else if (labelInput.includes("bug")) targetOptionId = process.env.OPTION_ID_TODO;
       else if (labelInput.includes("weekday")) targetOptionId = process.env.OPTION_ID_REVIEW;
@@ -171,8 +173,11 @@ client.on('messageCreate', async (message) => {
 });
 
 client.login(process.env.DISCORD_BOT_TOKEN);
-// This handles both the base link and the /api link
+
+// Server ping response
 app.get(['/', '/api'], (req, res) => {
   res.send('Zlice Engine & Webhook Listener Online');
 });
-app.listen(8080, () => console.log('Listening for Webhooks on Port 8080...'));
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`Listening for Webhooks on Port ${PORT}...`));
