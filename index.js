@@ -40,7 +40,6 @@ app.post('/webhook', async (req, res) => {
       const issueNumber = issueMatch[0];
       const currentBody = pr.body || "";
       
-      // If the tech team forgot to link it, the bot does it for them
       if (!currentBody.includes(`Closes #${issueNumber}`)) {
         try {
           const owner = cleanEnv(process.env.GITHUB_OWNER);
@@ -52,7 +51,6 @@ app.post('/webhook', async (req, res) => {
           }, {
             headers: { Authorization: `token ${cleanEnv(process.env.GITHUB_TOKEN)}` }
           });
-          console.log(`🔗 Auto-Linked PR #${prNumber} to Issue #${issueNumber}`);
         } catch (err) {
           console.error("❌ Auto-Linker failed:", err.message);
         }
@@ -81,7 +79,7 @@ app.post('/webhook', async (req, res) => {
   res.status(200).send('OK');
 });
 
-// --- FEATURE 2: BOARD SYNC LOGIC (DYNAMIC AUTOPILOT) ---
+// --- FEATURE 2: BOARD SYNC LOGIC (NAME-TARGETING EDITION) ---
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !/Labels?\s*->/i.test(message.content)) return;
 
@@ -91,11 +89,9 @@ client.on('messageCreate', async (message) => {
     let description = "";
     let labelInput = "";
 
-    // Extract Label
     const labelMatch = message.content.match(/Labels?\s*->\s*(.+)/i);
     if (labelMatch) labelInput = labelMatch[1].trim().toLowerCase();
 
-    // Extract Description
     const descMatch = message.content.match(/Description\s*->\s*([\s\S]*?)(?=Labels?\s*->)/i);
     if (descMatch) {
       description = descMatch[1].trim();
@@ -104,7 +100,6 @@ client.on('messageCreate', async (message) => {
       description = parts[0].trim();
     }
 
-    // Extract PR Number
     const prMatch = message.channel.name.match(/-(\d+)-/);
     if (!prMatch) return message.reply("❌ Cannot identify PR number from channel name.");
     const prNumber = parseInt(prMatch[1]);
@@ -113,7 +108,6 @@ client.on('messageCreate', async (message) => {
     const repo = cleanEnv(process.env.GITHUB_REPO);
     const restHeaders = { headers: { Authorization: `token ${cleanEnv(process.env.GITHUB_TOKEN)}` } };
 
-    // 1. BRIDGE THE GAP: explicitly find the Issue Number from the branch name
     let issueNumber = null;
     try {
       const prUrl = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`;
@@ -121,46 +115,38 @@ client.on('messageCreate', async (message) => {
       const branchName = prRes.data.head.ref;
       
       const issueMatch = branchName.match(/\d+/);
-      if (issueMatch) {
-        issueNumber = parseInt(issueMatch[0]);
-        console.log(`🌉 Bridged the Gap: PR #${prNumber} -> Issue #${issueNumber}`);
-      }
+      if (issueMatch) issueNumber = parseInt(issueMatch[0]);
     } catch (err) {
-      console.log("⚠️ Could not fetch branch details for bridging.");
+      console.log("⚠️ Could not fetch branch details.");
     }
 
-    // 2. REST API (Comments & Labels)
+    // 1. REST API
     const restBase = `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}`;
     await axios.post(`${restBase}/comments`, { body: `**Zlice Engine Update:**\n\n${description}` }, restHeaders);
     await axios.post(`${restBase}/labels`, { labels: [labelInput] }, restHeaders);
 
-    // 3. GRAPHQL API: DYNAMIC CARD DISCOVERY
+    // 2. GRAPHQL API
     const findItemQuery = `
       query($owner: String!, $repo: String!, $pr: Int!, $issue: Int!, $hasIssue: Boolean!) {
         repository(owner: $owner, name: $repo) {
           pullRequest(number: $pr) {
-            projectItems(first: 10) { nodes { id project { id } } }
+            projectItems(first: 10) { nodes { id project { id title } } }
             closingIssuesReferences(first: 10) {
-              nodes { projectItems(first: 10) { nodes { id project { id } } } }
+              nodes { projectItems(first: 10) { nodes { id project { id title } } } }
             }
           }
           issue(number: $issue) @include(if: $hasIssue) {
-            projectItems(first: 10) { nodes { id project { id } } }
+            projectItems(first: 10) { nodes { id project { id title } } }
           }
         }
       }`;
 
     const itemData = await queryGitHub(findItemQuery, { 
-      owner, 
-      repo, 
-      pr: prNumber, 
-      issue: issueNumber || 0, 
-      hasIssue: !!issueNumber 
+      owner, repo, pr: prNumber, issue: issueNumber || 0, hasIssue: !!issueNumber 
     });
     
     const repoData = itemData.data.data.repository;
     
-    // Store objects containing both the Item ID and its dynamic Project ID
     let itemsToMove = []; 
     let seenIds = new Set();
 
@@ -168,13 +154,16 @@ client.on('messageCreate', async (message) => {
       if (!nodes) return;
       nodes.forEach(node => {
         if (node && node.id && node.project && node.project.id && !seenIds.has(node.id)) {
-          seenIds.add(node.id);
-          itemsToMove.push({ itemId: node.id, projectId: node.project.id });
+          const title = (node.project.title || "").toLowerCase();
+          // THE ULTIMATE FILTER: Only select boards with "master" in the name
+          if (title.includes("master")) {
+            seenIds.add(node.id);
+            itemsToMove.push({ itemId: node.id, projectId: node.project.id, title: node.project.title });
+          }
         }
       });
     };
 
-    // Hunt for the card in all 3 possible locations
     if (repoData.pullRequest?.projectItems?.nodes) extractItems(repoData.pullRequest.projectItems.nodes);
     if (repoData.pullRequest?.closingIssuesReferences?.nodes) {
       repoData.pullRequest.closingIssuesReferences.nodes.forEach(issue => extractItems(issue.projectItems?.nodes));
@@ -182,23 +171,18 @@ client.on('messageCreate', async (message) => {
     if (repoData.issue?.projectItems?.nodes) extractItems(repoData.issue.projectItems.nodes);
 
     if (itemsToMove.length === 0) {
-      return message.reply(`⚠️ **Partial Sync:** Comment and label added, but the API returned 0 project cards for this Issue/PR. Please ensure Issue #${issueNumber || prNumber} is physically added to the Master Engine board in GitHub.`);
+      return message.reply(`⚠️ **Partial Sync:** Could not find this card on any board containing the word 'Master'. Ensure it is physically added to the Master Engine board.`);
     }
 
     let targetOptionId = "";
-    if (labelInput.includes("bug") || labelInput.includes("improvement")) {
-      targetOptionId = cleanEnv(process.env.OPTION_ID_TODO);
-    } else if (labelInput.includes("weekday")) {
-      targetOptionId = cleanEnv(process.env.OPTION_ID_REVIEW_FOUNDER);
-    } else if (labelInput.includes("weekend")) {
-      targetOptionId = cleanEnv(process.env.OPTION_ID_DONE);
-    }
+    if (labelInput.includes("bug") || labelInput.includes("improvement")) targetOptionId = cleanEnv(process.env.OPTION_ID_TODO);
+    else if (labelInput.includes("weekday")) targetOptionId = cleanEnv(process.env.OPTION_ID_REVIEW_FOUNDER);
+    else if (labelInput.includes("weekend")) targetOptionId = cleanEnv(process.env.OPTION_ID_DONE);
 
-    if (!targetOptionId) {
-      return message.reply(`⚠️ **Partial Sync:** Label '${labelInput}' added, but it doesn't match any board movement rules.`);
-    }
+    if (!targetOptionId) return message.reply(`⚠️ **Partial Sync:** Label '${labelInput}' added, but it doesn't match any movement rules.`);
 
-    // Move the cards dynamically!
+    // 3. SHIELDED EXECUTION
+    let moveErrors = [];
     for (const item of itemsToMove) {
       const moveMutation = `
         mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
@@ -207,15 +191,24 @@ client.on('messageCreate', async (message) => {
           }) { projectV2Item { id } }
         }`;
 
-      await queryGitHub(moveMutation, {
-        projectId: item.projectId, // Dynamically pulled from the board itself!
-        itemId: item.itemId,
-        fieldId: cleanEnv(process.env.STATUS_FIELD_ID),
-        optionId: targetOptionId
-      });
+      try {
+        await queryGitHub(moveMutation, {
+          projectId: item.projectId,
+          itemId: item.itemId,
+          fieldId: cleanEnv(process.env.STATUS_FIELD_ID),
+          optionId: targetOptionId
+        });
+      } catch (err) {
+        moveErrors.push(`Failed on board '${item.title}': ${err.message}`);
+      }
     }
 
-    message.reply(`✅ **Full Engine Sync Complete!**\n- Comment added\n- Label **${labelInput}** applied\n- ${itemsToMove.length} Board card(s) securely moved!`);
+    if (moveErrors.length > 0 && itemsToMove.length === moveErrors.length) {
+      // If ALL movement attempts failed, report the specific error so we can fix it!
+      return message.reply(`❌ **Sync failed during board movement.** The IDs in your Render environment (STATUS_FIELD_ID or OPTION_IDs) do not match the board '${itemsToMove[0].title}'. \n**Error:** ${moveErrors[0]}`);
+    }
+
+    message.reply(`✅ **Full Engine Sync Complete!**\n- Comment added\n- Label **${labelInput}** applied\n- Board card securely moved on '${itemsToMove[0].title}'!`);
 
   } catch (error) {
     console.error("🔥 CRITICAL ERROR:", error.message);
