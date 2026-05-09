@@ -10,7 +10,7 @@ const client = new Client({
 const app = express();
 app.use(bodyParser.json());
 
-// Helper to clean Render Environment Variables
+// Helper to clean Render Environment Variables of quotes and spaces
 const cleanEnv = (val) => val ? val.replace(/['"]/g, '').trim() : "";
 
 // --- HELPER: GITHUB GRAPHQL ---
@@ -34,12 +34,13 @@ app.post('/webhook', async (req, res) => {
     const prNumber = pr.number;
     const branchName = pr.head.ref; 
     
-    // Auto-Linker: Aggressively finds the first number in the branch name
+    // 🤖 ZLICE AUTO-LINKER: Aggressively finds the first number in the branch name
     const issueMatch = branchName.match(/\d+/);
     if (issueMatch) {
       const issueNumber = issueMatch[0];
       const currentBody = pr.body || "";
       
+      // If the tech team forgot to link it, the bot does it for them
       if (!currentBody.includes(`Closes #${issueNumber}`)) {
         try {
           const owner = cleanEnv(process.env.GITHUB_OWNER);
@@ -51,6 +52,7 @@ app.post('/webhook', async (req, res) => {
           }, {
             headers: { Authorization: `token ${cleanEnv(process.env.GITHUB_TOKEN)}` }
           });
+          console.log(`🔗 Auto-Linked PR #${prNumber} to Issue #${issueNumber}`);
         } catch (err) {
           console.error("❌ Auto-Linker failed:", err.message);
         }
@@ -79,7 +81,7 @@ app.post('/webhook', async (req, res) => {
   res.status(200).send('OK');
 });
 
-// --- FEATURE 2: BOARD SYNC LOGIC (THE "BRIDGE" EDITION) ---
+// --- FEATURE 2: BOARD SYNC LOGIC (DYNAMIC AUTOPILOT) ---
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !/Labels?\s*->/i.test(message.content)) return;
 
@@ -89,9 +91,11 @@ client.on('messageCreate', async (message) => {
     let description = "";
     let labelInput = "";
 
+    // Extract Label
     const labelMatch = message.content.match(/Labels?\s*->\s*(.+)/i);
     if (labelMatch) labelInput = labelMatch[1].trim().toLowerCase();
 
+    // Extract Description
     const descMatch = message.content.match(/Description\s*->\s*([\s\S]*?)(?=Labels?\s*->)/i);
     if (descMatch) {
       description = descMatch[1].trim();
@@ -100,6 +104,7 @@ client.on('messageCreate', async (message) => {
       description = parts[0].trim();
     }
 
+    // Extract PR Number
     const prMatch = message.channel.name.match(/-(\d+)-/);
     if (!prMatch) return message.reply("❌ Cannot identify PR number from channel name.");
     const prNumber = parseInt(prMatch[1]);
@@ -108,17 +113,17 @@ client.on('messageCreate', async (message) => {
     const repo = cleanEnv(process.env.GITHUB_REPO);
     const restHeaders = { headers: { Authorization: `token ${cleanEnv(process.env.GITHUB_TOKEN)}` } };
 
-    // 1. BRIDGE THE GAP: Fetch branch name to explicitly find the Issue Number
+    // 1. BRIDGE THE GAP: explicitly find the Issue Number from the branch name
     let issueNumber = null;
     try {
       const prUrl = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`;
       const prRes = await axios.get(prUrl, restHeaders);
       const branchName = prRes.data.head.ref;
       
-      const issueMatch = branchName.match(/\d+/); // Grabs the first number in the branch
+      const issueMatch = branchName.match(/\d+/);
       if (issueMatch) {
         issueNumber = parseInt(issueMatch[0]);
-        console.log(`🌉 Bridged the Gap! PR #${prNumber} -> Branch '${branchName}' -> Issue #${issueNumber}`);
+        console.log(`🌉 Bridged the Gap: PR #${prNumber} -> Issue #${issueNumber}`);
       }
     } catch (err) {
       console.log("⚠️ Could not fetch branch details for bridging.");
@@ -129,7 +134,7 @@ client.on('messageCreate', async (message) => {
     await axios.post(`${restBase}/comments`, { body: `**Zlice Engine Update:**\n\n${description}` }, restHeaders);
     await axios.post(`${restBase}/labels`, { labels: [labelInput] }, restHeaders);
 
-    // 3. GRAPHQL API (Query BOTH the PR and the explicitly bridged Issue)
+    // 3. GRAPHQL API: DYNAMIC CARD DISCOVERY
     const findItemQuery = `
       query($owner: String!, $repo: String!, $pr: Int!, $issue: Int!, $hasIssue: Boolean!) {
         repository(owner: $owner, name: $repo) {
@@ -154,36 +159,30 @@ client.on('messageCreate', async (message) => {
     });
     
     const repoData = itemData.data.data.repository;
-    const targetProjectId = cleanEnv(process.env.PROJECT_ID);
     
-    // Use a Set so we don't accidentally move the same card twice
-    let itemIdsToMove = new Set(); 
+    // Store objects containing both the Item ID and its dynamic Project ID
+    let itemsToMove = []; 
+    let seenIds = new Set();
 
-    // A. Check PR directly
-    if (repoData.pullRequest?.projectItems?.nodes) {
-      repoData.pullRequest.projectItems.nodes.forEach(node => {
-        if (node.project.id === targetProjectId) itemIdsToMove.add(node.id);
-      });
-    }
-    // B. Check Native GitHub Links
-    if (repoData.pullRequest?.closingIssuesReferences?.nodes) {
-      repoData.pullRequest.closingIssuesReferences.nodes.forEach(issue => {
-        if (issue.projectItems?.nodes) {
-          issue.projectItems.nodes.forEach(node => {
-            if (node.project.id === targetProjectId) itemIdsToMove.add(node.id);
-          });
+    const extractItems = (nodes) => {
+      if (!nodes) return;
+      nodes.forEach(node => {
+        if (node && node.id && node.project && node.project.id && !seenIds.has(node.id)) {
+          seenIds.add(node.id);
+          itemsToMove.push({ itemId: node.id, projectId: node.project.id });
         }
       });
-    }
-    // C. Check the Explicitly Bridged Issue (This is what fixes the bug!)
-    if (repoData.issue?.projectItems?.nodes) {
-      repoData.issue.projectItems.nodes.forEach(node => {
-        if (node.project.id === targetProjectId) itemIdsToMove.add(node.id);
-      });
-    }
+    };
 
-    if (itemIdsToMove.size === 0) {
-      return message.reply(`⚠️ **Partial Sync:** Comment and label added, but I could not find a visible card on the Master Engine board to move!`);
+    // Hunt for the card in all 3 possible locations
+    if (repoData.pullRequest?.projectItems?.nodes) extractItems(repoData.pullRequest.projectItems.nodes);
+    if (repoData.pullRequest?.closingIssuesReferences?.nodes) {
+      repoData.pullRequest.closingIssuesReferences.nodes.forEach(issue => extractItems(issue.projectItems?.nodes));
+    }
+    if (repoData.issue?.projectItems?.nodes) extractItems(repoData.issue.projectItems.nodes);
+
+    if (itemsToMove.length === 0) {
+      return message.reply(`⚠️ **Partial Sync:** Comment and label added, but the API returned 0 project cards for this Issue/PR. Please ensure Issue #${issueNumber || prNumber} is physically added to the Master Engine board in GitHub.`);
     }
 
     let targetOptionId = "";
@@ -199,8 +198,8 @@ client.on('messageCreate', async (message) => {
       return message.reply(`⚠️ **Partial Sync:** Label '${labelInput}' added, but it doesn't match any board movement rules.`);
     }
 
-    // Move the cards
-    for (const itemId of itemIdsToMove) {
+    // Move the cards dynamically!
+    for (const item of itemsToMove) {
       const moveMutation = `
         mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
           updateProjectV2ItemFieldValue(input: {
@@ -209,14 +208,14 @@ client.on('messageCreate', async (message) => {
         }`;
 
       await queryGitHub(moveMutation, {
-        projectId: targetProjectId,
-        itemId: itemId,
+        projectId: item.projectId, // Dynamically pulled from the board itself!
+        itemId: item.itemId,
         fieldId: cleanEnv(process.env.STATUS_FIELD_ID),
         optionId: targetOptionId
       });
     }
 
-    message.reply(`✅ **Full Engine Sync Complete!**\n- Comment added\n- Label **${labelInput}** applied\n- ${itemIdsToMove.size} Board card(s) securely moved!`);
+    message.reply(`✅ **Full Engine Sync Complete!**\n- Comment added\n- Label **${labelInput}** applied\n- ${itemsToMove.length} Board card(s) securely moved!`);
 
   } catch (error) {
     console.error("🔥 CRITICAL ERROR:", error.message);
