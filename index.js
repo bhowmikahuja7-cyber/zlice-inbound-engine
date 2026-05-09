@@ -10,10 +10,13 @@ const client = new Client({
 const app = express();
 app.use(bodyParser.json());
 
+// Helper to clean Render Environment Variables of quotes and spaces
+const cleanEnv = (val) => val ? val.replace(/['"]/g, '').trim() : "";
+
 // --- HELPER: GITHUB GRAPHQL ---
 async function queryGitHub(query, variables) {
   const response = await axios.post('https://api.github.com/graphql', { query, variables }, {
-    headers: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` }
+    headers: { Authorization: `Bearer ${cleanEnv(process.env.GITHUB_TOKEN)}` }
   });
   if (response.data.errors) {
     throw new Error(JSON.stringify(response.data.errors[0].message));
@@ -21,7 +24,7 @@ async function queryGitHub(query, variables) {
   return response;
 }
 
-// --- FEATURE 1: AUTOMATED CHANNEL CREATION ---
+// --- FEATURE 1: AUTOMATED CHANNEL CREATION & AUTO-LINKER ---
 app.post('/webhook', async (req, res) => {
   const event = req.headers['x-github-event'];
   const action = req.body.action;
@@ -29,9 +32,36 @@ app.post('/webhook', async (req, res) => {
   if (event === 'pull_request' && action === 'opened') {
     const pr = req.body.pull_request;
     const prNumber = pr.number;
+    const branchName = pr.head.ref; // Grabs the branch name (e.g., '3-testing')
     
+    // --- 🤖 ZLICE AUTO-LINKER ---
+    // If the branch starts with a number, the bot auto-edits the PR to link the issue!
+    const issueMatch = branchName.match(/^(\d+)-/);
+    if (issueMatch) {
+      const issueNumber = issueMatch[1];
+      const currentBody = pr.body || "";
+      
+      if (!currentBody.includes(`Closes #${issueNumber}`)) {
+        try {
+          const owner = cleanEnv(process.env.GITHUB_OWNER);
+          const repo = cleanEnv(process.env.GITHUB_REPO);
+          const updateUrl = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`;
+          
+          await axios.patch(updateUrl, {
+            body: `${currentBody}\n\n> 🤖 *Zlice Auto-Linker: Automatically linked to* Closes #${issueNumber}`
+          }, {
+            headers: { Authorization: `token ${cleanEnv(process.env.GITHUB_TOKEN)}` }
+          });
+          console.log(`🔗 Auto-Linked PR #${prNumber} to Issue #${issueNumber}`);
+        } catch (err) {
+          console.error("❌ Auto-Linker failed:", err.message);
+        }
+      }
+    }
+    // ----------------------------
+
     const prTitleFormatted = pr.title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-    const repoName = process.env.GITHUB_REPO.toLowerCase();
+    const repoName = cleanEnv(process.env.GITHUB_REPO).toLowerCase();
     const channelName = `${repoName}-${prNumber}-${prTitleFormatted}`;
 
     try {
@@ -62,11 +92,9 @@ client.on('messageCreate', async (message) => {
     let description = "";
     let labelInput = "";
 
-    // Extract Label
     const labelMatch = message.content.match(/Labels?\s*->\s*(.+)/i);
     if (labelMatch) labelInput = labelMatch[1].trim().toLowerCase();
 
-    // Extract Description
     const descMatch = message.content.match(/Description\s*->\s*([\s\S]*?)(?=Labels?\s*->)/i);
     if (descMatch) {
       description = descMatch[1].trim();
@@ -79,33 +107,35 @@ client.on('messageCreate', async (message) => {
     if (!prMatch) return message.reply("❌ Cannot identify PR number from channel name.");
     const prNumber = parseInt(prMatch[1]);
 
-    // 1. EXECUTE REST API (Comments & Labels)
-    const restBase = `https://api.github.com/repos/${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}/issues/${prNumber}`;
-    const restHeaders = { headers: { Authorization: `token ${process.env.GITHUB_TOKEN}` } };
+    const owner = cleanEnv(process.env.GITHUB_OWNER);
+    const repo = cleanEnv(process.env.GITHUB_REPO);
+
+    // 1. REST API
+    const restBase = `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}`;
+    const restHeaders = { headers: { Authorization: `token ${cleanEnv(process.env.GITHUB_TOKEN)}` } };
     await axios.post(`${restBase}/comments`, { body: `**Zlice Engine Update:**\n\n${description}` }, restHeaders);
     await axios.post(`${restBase}/labels`, { labels: [labelInput] }, restHeaders);
-    console.log(`✅ REST Sync Complete: Label '${labelInput}' applied.`);
 
-    // 2. EXECUTE GRAPHQL API (Board Movement)
+    // 2. GRAPHQL API
     const findItemQuery = `
       query($owner: String!, $repo: String!, $pr: Int!) {
         repository(owner: $owner, name: $repo) {
           pullRequest(number: $pr) {
-            projectItems(first: 10) { nodes { id project { id } } }
+            projectItems(first: 10) { nodes { id project { id title } } }
             closingIssuesReferences(first: 10) {
-              nodes { projectItems(first: 10) { nodes { id project { id } } } }
+              nodes { projectItems(first: 10) { nodes { id project { id title } } } }
             }
           }
         }
       }`;
 
-    const itemData = await queryGitHub(findItemQuery, { owner: process.env.GITHUB_OWNER, repo: process.env.GITHUB_REPO, pr: prNumber });
+    const itemData = await queryGitHub(findItemQuery, { owner, repo, pr: prNumber });
     const prData = itemData.data.data.repository.pullRequest;
 
-    const targetProjectId = process.env.PROJECT_ID.trim();
+    const targetProjectId = cleanEnv(process.env.PROJECT_ID);
     let itemIdsToMove = [];
 
-    // Gather ALL cards linked to this PR (The PR itself + Linked Issues)
+    // Search logic with debugging
     if (prData.projectItems.nodes) {
       prData.projectItems.nodes.forEach(node => {
         if (node.project.id === targetProjectId) itemIdsToMove.push(node.id);
@@ -125,21 +155,20 @@ client.on('messageCreate', async (message) => {
       return message.reply(`⚠️ **Partial Sync:** Comment and label added, but I could not find a visible card on the Master Engine board to move!`);
     }
 
-    // Determine target column based on your exact rules
     let targetOptionId = "";
     if (labelInput.includes("bug") || labelInput.includes("improvement")) {
-      targetOptionId = process.env.OPTION_ID_TODO.trim();
+      targetOptionId = cleanEnv(process.env.OPTION_ID_TODO);
     } else if (labelInput.includes("weekday")) {
-      targetOptionId = process.env.OPTION_ID_REVIEW_FOUNDER.trim();
+      targetOptionId = cleanEnv(process.env.OPTION_ID_REVIEW_FOUNDER);
     } else if (labelInput.includes("weekend")) {
-      targetOptionId = process.env.OPTION_ID_DONE.trim();
+      targetOptionId = cleanEnv(process.env.OPTION_ID_DONE);
     }
 
     if (!targetOptionId) {
-      return message.reply(`⚠️ **Partial Sync:** Label '${labelInput}' added, but it doesn't match any movement rules (bug, weekday, weekend). Card stayed put.`);
+      return message.reply(`⚠️ **Partial Sync:** Label '${labelInput}' added, but it doesn't match any board movement rules.`);
     }
 
-    // Move every single card found
+    // Move the cards
     for (const itemId of itemIdsToMove) {
       const moveMutation = `
         mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
@@ -151,12 +180,12 @@ client.on('messageCreate', async (message) => {
       await queryGitHub(moveMutation, {
         projectId: targetProjectId,
         itemId: itemId,
-        fieldId: process.env.STATUS_FIELD_ID.trim(),
+        fieldId: cleanEnv(process.env.STATUS_FIELD_ID),
         optionId: targetOptionId
       });
     }
 
-    message.reply(`✅ **Full Engine Sync Complete!**\n- Comment added\n- Label **${labelInput}** applied\n- ${itemIdsToMove.length} card(s) securely moved.`);
+    message.reply(`✅ **Engine Sync Complete**\n- Comment added\n- Label **${labelInput}** applied\n- Board card securely moved!`);
 
   } catch (error) {
     console.error("🔥 CRITICAL ERROR:", error.message);
@@ -164,11 +193,7 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-client.login(process.env.DISCORD_BOT_TOKEN);
+client.login(cleanEnv(process.env.DISCORD_BOT_TOKEN));
 
-app.get(['/', '/api'], (req, res) => {
-  res.send('Zlice Engine & Webhook Listener Online');
-});
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Listening for Webhooks on Port ${PORT}...`));
+app.get(['/', '/api'], (req, res) => res.send('Zlice Engine Online'));
+app.listen(process.env.PORT || 8080, () => console.log('Listening...'));
