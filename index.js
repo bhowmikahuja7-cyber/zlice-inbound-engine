@@ -10,7 +10,7 @@ const client = new Client({
 const app = express();
 app.use(bodyParser.json());
 
-// Helper to clean Render Environment Variables of quotes and spaces
+// Helper to clean Render Environment Variables
 const cleanEnv = (val) => val ? val.replace(/['"]/g, '').trim() : "";
 
 // --- HELPER: GITHUB GRAPHQL ---
@@ -32,13 +32,12 @@ app.post('/webhook', async (req, res) => {
   if (event === 'pull_request' && action === 'opened') {
     const pr = req.body.pull_request;
     const prNumber = pr.number;
-    const branchName = pr.head.ref; // Grabs the branch name (e.g., '3-testing')
+    const branchName = pr.head.ref; 
     
-    // --- 🤖 ZLICE AUTO-LINKER ---
-    // If the branch starts with a number, the bot auto-edits the PR to link the issue!
-    const issueMatch = branchName.match(/^(\d+)-/);
+    // Auto-Linker: Aggressively finds the first number in the branch name
+    const issueMatch = branchName.match(/\d+/);
     if (issueMatch) {
-      const issueNumber = issueMatch[1];
+      const issueNumber = issueMatch[0];
       const currentBody = pr.body || "";
       
       if (!currentBody.includes(`Closes #${issueNumber}`)) {
@@ -52,13 +51,11 @@ app.post('/webhook', async (req, res) => {
           }, {
             headers: { Authorization: `token ${cleanEnv(process.env.GITHUB_TOKEN)}` }
           });
-          console.log(`🔗 Auto-Linked PR #${prNumber} to Issue #${issueNumber}`);
         } catch (err) {
           console.error("❌ Auto-Linker failed:", err.message);
         }
       }
     }
-    // ----------------------------
 
     const prTitleFormatted = pr.title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
     const repoName = cleanEnv(process.env.GITHUB_REPO).toLowerCase();
@@ -82,7 +79,7 @@ app.post('/webhook', async (req, res) => {
   res.status(200).send('OK');
 });
 
-// --- FEATURE 2: BOARD SYNC LOGIC (BULLETPROOF EDITION) ---
+// --- FEATURE 2: BOARD SYNC LOGIC (THE "BRIDGE" EDITION) ---
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !/Labels?\s*->/i.test(message.content)) return;
 
@@ -109,49 +106,83 @@ client.on('messageCreate', async (message) => {
 
     const owner = cleanEnv(process.env.GITHUB_OWNER);
     const repo = cleanEnv(process.env.GITHUB_REPO);
-
-    // 1. REST API
-    const restBase = `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}`;
     const restHeaders = { headers: { Authorization: `token ${cleanEnv(process.env.GITHUB_TOKEN)}` } };
+
+    // 1. BRIDGE THE GAP: Fetch branch name to explicitly find the Issue Number
+    let issueNumber = null;
+    try {
+      const prUrl = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`;
+      const prRes = await axios.get(prUrl, restHeaders);
+      const branchName = prRes.data.head.ref;
+      
+      const issueMatch = branchName.match(/\d+/); // Grabs the first number in the branch
+      if (issueMatch) {
+        issueNumber = parseInt(issueMatch[0]);
+        console.log(`🌉 Bridged the Gap! PR #${prNumber} -> Branch '${branchName}' -> Issue #${issueNumber}`);
+      }
+    } catch (err) {
+      console.log("⚠️ Could not fetch branch details for bridging.");
+    }
+
+    // 2. REST API (Comments & Labels)
+    const restBase = `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}`;
     await axios.post(`${restBase}/comments`, { body: `**Zlice Engine Update:**\n\n${description}` }, restHeaders);
     await axios.post(`${restBase}/labels`, { labels: [labelInput] }, restHeaders);
 
-    // 2. GRAPHQL API
+    // 3. GRAPHQL API (Query BOTH the PR and the explicitly bridged Issue)
     const findItemQuery = `
-      query($owner: String!, $repo: String!, $pr: Int!) {
+      query($owner: String!, $repo: String!, $pr: Int!, $issue: Int!, $hasIssue: Boolean!) {
         repository(owner: $owner, name: $repo) {
           pullRequest(number: $pr) {
-            projectItems(first: 10) { nodes { id project { id title } } }
+            projectItems(first: 10) { nodes { id project { id } } }
             closingIssuesReferences(first: 10) {
-              nodes { projectItems(first: 10) { nodes { id project { id title } } } }
+              nodes { projectItems(first: 10) { nodes { id project { id } } } }
             }
+          }
+          issue(number: $issue) @include(if: $hasIssue) {
+            projectItems(first: 10) { nodes { id project { id } } }
           }
         }
       }`;
 
-    const itemData = await queryGitHub(findItemQuery, { owner, repo, pr: prNumber });
-    const prData = itemData.data.data.repository.pullRequest;
-
+    const itemData = await queryGitHub(findItemQuery, { 
+      owner, 
+      repo, 
+      pr: prNumber, 
+      issue: issueNumber || 0, 
+      hasIssue: !!issueNumber 
+    });
+    
+    const repoData = itemData.data.data.repository;
     const targetProjectId = cleanEnv(process.env.PROJECT_ID);
-    let itemIdsToMove = [];
+    
+    // Use a Set so we don't accidentally move the same card twice
+    let itemIdsToMove = new Set(); 
 
-    // Search logic with debugging
-    if (prData.projectItems.nodes) {
-      prData.projectItems.nodes.forEach(node => {
-        if (node.project.id === targetProjectId) itemIdsToMove.push(node.id);
+    // A. Check PR directly
+    if (repoData.pullRequest?.projectItems?.nodes) {
+      repoData.pullRequest.projectItems.nodes.forEach(node => {
+        if (node.project.id === targetProjectId) itemIdsToMove.add(node.id);
       });
     }
-    if (prData.closingIssuesReferences.nodes) {
-      prData.closingIssuesReferences.nodes.forEach(issue => {
-        if (issue.projectItems.nodes) {
+    // B. Check Native GitHub Links
+    if (repoData.pullRequest?.closingIssuesReferences?.nodes) {
+      repoData.pullRequest.closingIssuesReferences.nodes.forEach(issue => {
+        if (issue.projectItems?.nodes) {
           issue.projectItems.nodes.forEach(node => {
-            if (node.project.id === targetProjectId) itemIdsToMove.push(node.id);
+            if (node.project.id === targetProjectId) itemIdsToMove.add(node.id);
           });
         }
       });
     }
+    // C. Check the Explicitly Bridged Issue (This is what fixes the bug!)
+    if (repoData.issue?.projectItems?.nodes) {
+      repoData.issue.projectItems.nodes.forEach(node => {
+        if (node.project.id === targetProjectId) itemIdsToMove.add(node.id);
+      });
+    }
 
-    if (itemIdsToMove.length === 0) {
+    if (itemIdsToMove.size === 0) {
       return message.reply(`⚠️ **Partial Sync:** Comment and label added, but I could not find a visible card on the Master Engine board to move!`);
     }
 
@@ -185,7 +216,7 @@ client.on('messageCreate', async (message) => {
       });
     }
 
-    message.reply(`✅ **Engine Sync Complete**\n- Comment added\n- Label **${labelInput}** applied\n- Board card securely moved!`);
+    message.reply(`✅ **Full Engine Sync Complete!**\n- Comment added\n- Label **${labelInput}** applied\n- ${itemIdsToMove.size} Board card(s) securely moved!`);
 
   } catch (error) {
     console.error("🔥 CRITICAL ERROR:", error.message);
