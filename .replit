@@ -35,8 +35,8 @@ externalPort = 80
 [userenv]
 
 [userenv.shared]
-GITHUB_OWNER = "bhowmikahuja7-cyber"
-GITHUB_REPO = "zlice-sandbox-test"
+GITHUB_OWNER = "Zlice-Org"
+GITHUB_REPO = "Zlice-Kitchen"
 STATUS_FIELD_ID = "PVTSSF_lAHODa11S84BW2mQzhSHllw"
 OPTION_ID_TODO = "61e4505c"
 OPTION_ID_REVIEW = "f75ad846"
