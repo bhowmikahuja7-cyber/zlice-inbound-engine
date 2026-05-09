@@ -16,8 +16,7 @@ async function queryGitHub(query, variables) {
     headers: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` }
   });
   if (response.data.errors) {
-    console.error("🚨 GRAPHQL ERROR:", JSON.stringify(response.data.errors, null, 2));
-    throw new Error("GitHub rejected the GraphQL request.");
+    throw new Error(JSON.stringify(response.data.errors[0].message));
   }
   return response;
 }
@@ -45,7 +44,6 @@ app.post('/webhook', async (req, res) => {
         topic: `Discussion for PR #${prNumber}: ${pr.html_url}`,
       });
 
-      console.log(`🚀 Automated Channel Created: #${channelName}`);
       newChannel.send(`🚀 **New PR Raised:** #${prNumber}\n**Title:** ${pr.title}\n**Link:** ${pr.html_url}\n\nUse \`Description -> ...\` and \`Label -> ...\` here to sync with the board.`);
     } catch (err) {
       console.error("❌ Failed to create channel:", err);
@@ -54,7 +52,7 @@ app.post('/webhook', async (req, res) => {
   res.status(200).send('OK');
 });
 
-// --- FEATURE 2: BOARD SYNC LOGIC ---
+// --- FEATURE 2: BOARD SYNC LOGIC (BULLETPROOF EDITION) ---
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !/Labels?\s*->/i.test(message.content)) return;
 
@@ -64,9 +62,11 @@ client.on('messageCreate', async (message) => {
     let description = "";
     let labelInput = "";
 
+    // Extract Label
     const labelMatch = message.content.match(/Labels?\s*->\s*(.+)/i);
     if (labelMatch) labelInput = labelMatch[1].trim().toLowerCase();
 
+    // Extract Description
     const descMatch = message.content.match(/Description\s*->\s*([\s\S]*?)(?=Labels?\s*->)/i);
     if (descMatch) {
       description = descMatch[1].trim();
@@ -79,28 +79,21 @@ client.on('messageCreate', async (message) => {
     if (!prMatch) return message.reply("❌ Cannot identify PR number from channel name.");
     const prNumber = parseInt(prMatch[1]);
 
-    console.log(`📌 Target Repo: ${process.env.GITHUB_REPO} | PR: ${prNumber} | Label: "${labelInput}"`);
-
-    // REST API
+    // 1. EXECUTE REST API (Comments & Labels)
     const restBase = `https://api.github.com/repos/${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}/issues/${prNumber}`;
     const restHeaders = { headers: { Authorization: `token ${process.env.GITHUB_TOKEN}` } };
     await axios.post(`${restBase}/comments`, { body: `**Zlice Engine Update:**\n\n${description}` }, restHeaders);
     await axios.post(`${restBase}/labels`, { labels: [labelInput] }, restHeaders);
+    console.log(`✅ REST Sync Complete: Label '${labelInput}' applied.`);
 
-    // GraphQL API
+    // 2. EXECUTE GRAPHQL API (Board Movement)
     const findItemQuery = `
       query($owner: String!, $repo: String!, $pr: Int!) {
         repository(owner: $owner, name: $repo) {
           pullRequest(number: $pr) {
-            projectItems(first: 10) {
-              nodes { id project { id title } }
-            }
+            projectItems(first: 10) { nodes { id project { id } } }
             closingIssuesReferences(first: 10) {
-              nodes {
-                projectItems(first: 10) {
-                  nodes { id project { id title } }
-                }
-              }
+              nodes { projectItems(first: 10) { nodes { id project { id } } } }
             }
           }
         }
@@ -109,64 +102,65 @@ client.on('messageCreate', async (message) => {
     const itemData = await queryGitHub(findItemQuery, { owner: process.env.GITHUB_OWNER, repo: process.env.GITHUB_REPO, pr: prNumber });
     const prData = itemData.data.data.repository.pullRequest;
 
-    const targetProjectId = process.env.PROJECT_ID.trim(); // Target the specific Master Engine
-    let projectItem = null;
+    const targetProjectId = process.env.PROJECT_ID.trim();
+    let itemIdsToMove = [];
 
-    // A. STRICT FILTER: Look only for the target Project ID in the PR itself
+    // Gather ALL cards linked to this PR (The PR itself + Linked Issues)
     if (prData.projectItems.nodes) {
-      projectItem = prData.projectItems.nodes.find(node => node.project.id === targetProjectId);
+      prData.projectItems.nodes.forEach(node => {
+        if (node.project.id === targetProjectId) itemIdsToMove.push(node.id);
+      });
     }
-    
-    // B. STRICT FILTER: Look only for the target Project ID in linked Issues
-    if (!projectItem && prData.closingIssuesReferences.nodes) {
-      for (const issue of prData.closingIssuesReferences.nodes) {
+    if (prData.closingIssuesReferences.nodes) {
+      prData.closingIssuesReferences.nodes.forEach(issue => {
         if (issue.projectItems.nodes) {
-          projectItem = issue.projectItems.nodes.find(node => node.project.id === targetProjectId);
-          if (projectItem) break;
+          issue.projectItems.nodes.forEach(node => {
+            if (node.project.id === targetProjectId) itemIdsToMove.push(node.id);
+          });
         }
-      }
+      });
     }
 
-    if (projectItem) {
-      let targetOptionId = "";
-
-      // --- YOUR NEW CUSTOM LABEL LOGIC ---
-      if (labelInput.includes("bug") || labelInput.includes("improvement")) {
-        targetOptionId = process.env.OPTION_ID_TODO.trim(); // Move to To-Do
-      } 
-      else if (labelInput.includes("done review (weekday)")) {
-        targetOptionId = process.env.OPTION_ID_REVIEW_FOUNDER.trim(); // Move to In review (Founders)
-      } 
-      else if (labelInput.includes("done review (weekend)")) {
-        targetOptionId = process.env.OPTION_ID_DONE.trim(); // Move to Done
-      }
-
-      if (targetOptionId) {
-        const moveMutation = `
-          mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
-            updateProjectV2ItemFieldValue(input: {
-              projectId: $projectId,
-              itemId: $itemId,
-              fieldId: $fieldId,
-              value: { singleSelectOptionId: $optionId }
-            }) { projectV2Item { id } }
-          }`;
-
-        await queryGitHub(moveMutation, {
-          projectId: projectItem.project.id,
-          itemId: projectItem.id,
-          fieldId: process.env.STATUS_FIELD_ID.trim(),
-          optionId: targetOptionId
-        });
-      }
-    } else {
-      console.log("❌ Card not found on the Zlice Master Engine board.");
+    if (itemIdsToMove.length === 0) {
+      return message.reply(`⚠️ **Partial Sync:** Comment and label added, but I could not find a visible card on the Master Engine board to move!`);
     }
 
-    message.reply(`✅ **Engine Sync Complete**\n- Comment added\n- Label **${labelInput}** applied\n- Board card moved.`);
+    // Determine target column based on your exact rules
+    let targetOptionId = "";
+    if (labelInput.includes("bug") || labelInput.includes("improvement")) {
+      targetOptionId = process.env.OPTION_ID_TODO.trim();
+    } else if (labelInput.includes("weekday")) {
+      targetOptionId = process.env.OPTION_ID_REVIEW_FOUNDER.trim();
+    } else if (labelInput.includes("weekend")) {
+      targetOptionId = process.env.OPTION_ID_DONE.trim();
+    }
+
+    if (!targetOptionId) {
+      return message.reply(`⚠️ **Partial Sync:** Label '${labelInput}' added, but it doesn't match any movement rules (bug, weekday, weekend). Card stayed put.`);
+    }
+
+    // Move every single card found
+    for (const itemId of itemIdsToMove) {
+      const moveMutation = `
+        mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+          updateProjectV2ItemFieldValue(input: {
+            projectId: $projectId, itemId: $itemId, fieldId: $fieldId, value: { singleSelectOptionId: $optionId }
+          }) { projectV2Item { id } }
+        }`;
+
+      await queryGitHub(moveMutation, {
+        projectId: targetProjectId,
+        itemId: itemId,
+        fieldId: process.env.STATUS_FIELD_ID.trim(),
+        optionId: targetOptionId
+      });
+    }
+
+    message.reply(`✅ **Full Engine Sync Complete!**\n- Comment added\n- Label **${labelInput}** applied\n- ${itemIdsToMove.length} card(s) securely moved.`);
+
   } catch (error) {
     console.error("🔥 CRITICAL ERROR:", error.message);
-    message.reply("❌ Sync failed. Check Render logs.");
+    message.reply(`❌ **Sync failed at GraphQL layer:** ${error.message}`);
   }
 });
 
