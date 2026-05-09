@@ -22,7 +22,7 @@ async function queryGitHub(query, variables) {
   return response;
 }
 
-// --- FEATURE 1: AUTOMATED CHANNEL CREATION (SINGLE REPO) ---
+// --- FEATURE 1: AUTOMATED CHANNEL CREATION ---
 app.post('/webhook', async (req, res) => {
   const event = req.headers['x-github-event'];
   const action = req.body.action;
@@ -31,10 +31,7 @@ app.post('/webhook', async (req, res) => {
     const pr = req.body.pull_request;
     const prNumber = pr.number;
     
-    // Format Title: Replaces spaces/special chars with dashes
     const prTitleFormatted = pr.title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-    
-    // Format: #zlice-kitchen-15-feature-name
     const repoName = process.env.GITHUB_REPO.toLowerCase();
     const channelName = `${repoName}-${prNumber}-${prTitleFormatted}`;
 
@@ -57,7 +54,7 @@ app.post('/webhook', async (req, res) => {
   res.status(200).send('OK');
 });
 
-// --- FEATURE 2: BOARD SYNC LOGIC (SINGLE REPO ROUTING) ---
+// --- FEATURE 2: BOARD SYNC LOGIC ---
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !/Labels?\s*->/i.test(message.content)) return;
 
@@ -67,11 +64,9 @@ client.on('messageCreate', async (message) => {
     let description = "";
     let labelInput = "";
 
-    // Extract Label
     const labelMatch = message.content.match(/Labels?\s*->\s*(.+)/i);
     if (labelMatch) labelInput = labelMatch[1].trim().toLowerCase();
 
-    // Extract Description
     const descMatch = message.content.match(/Description\s*->\s*([\s\S]*?)(?=Labels?\s*->)/i);
     if (descMatch) {
       description = descMatch[1].trim();
@@ -80,31 +75,29 @@ client.on('messageCreate', async (message) => {
       description = parts[0].trim();
     }
 
-    // Extract PR Number from channel name (looks for the number sandwiched by dashes)
-    // Example: zlice-kitchen-15-add-login -> Extracts '15'
     const prMatch = message.channel.name.match(/-(\d+)-/);
-    if (!prMatch) return message.reply("❌ Cannot identify PR number from channel name. Make sure it has '-[number]-'.");
+    if (!prMatch) return message.reply("❌ Cannot identify PR number from channel name.");
     const prNumber = parseInt(prMatch[1]);
 
     console.log(`📌 Target Repo: ${process.env.GITHUB_REPO} | PR: ${prNumber} | Label: "${labelInput}"`);
 
-    // REST API: Target the single repo explicitly
+    // REST API
     const restBase = `https://api.github.com/repos/${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}/issues/${prNumber}`;
     const restHeaders = { headers: { Authorization: `token ${process.env.GITHUB_TOKEN}` } };
     await axios.post(`${restBase}/comments`, { body: `**Zlice Engine Update:**\n\n${description}` }, restHeaders);
     await axios.post(`${restBase}/labels`, { labels: [labelInput] }, restHeaders);
 
-    // GraphQL API: Locate card on board
+    // GraphQL API
     const findItemQuery = `
       query($owner: String!, $repo: String!, $pr: Int!) {
         repository(owner: $owner, name: $repo) {
           pullRequest(number: $pr) {
-            projectItems(first: 5) {
+            projectItems(first: 10) {
               nodes { id project { id title } }
             }
-            closingIssuesReferences(first: 5) {
+            closingIssuesReferences(first: 10) {
               nodes {
-                projectItems(first: 5) {
+                projectItems(first: 10) {
                   nodes { id project { id title } }
                 }
               }
@@ -116,15 +109,20 @@ client.on('messageCreate', async (message) => {
     const itemData = await queryGitHub(findItemQuery, { owner: process.env.GITHUB_OWNER, repo: process.env.GITHUB_REPO, pr: prNumber });
     const prData = itemData.data.data.repository.pullRequest;
 
+    const targetProjectId = process.env.PROJECT_ID.trim(); // Target the specific Master Engine
     let projectItem = null;
 
-    if (prData.projectItems.nodes && prData.projectItems.nodes.length > 0) {
-      projectItem = prData.projectItems.nodes[0];
-    } else if (prData.closingIssuesReferences.nodes && prData.closingIssuesReferences.nodes.length > 0) {
+    // A. STRICT FILTER: Look only for the target Project ID in the PR itself
+    if (prData.projectItems.nodes) {
+      projectItem = prData.projectItems.nodes.find(node => node.project.id === targetProjectId);
+    }
+    
+    // B. STRICT FILTER: Look only for the target Project ID in linked Issues
+    if (!projectItem && prData.closingIssuesReferences.nodes) {
       for (const issue of prData.closingIssuesReferences.nodes) {
-        if (issue.projectItems.nodes && issue.projectItems.nodes.length > 0) {
-          projectItem = issue.projectItems.nodes[0];
-          break;
+        if (issue.projectItems.nodes) {
+          projectItem = issue.projectItems.nodes.find(node => node.project.id === targetProjectId);
+          if (projectItem) break;
         }
       }
     }
@@ -132,11 +130,16 @@ client.on('messageCreate', async (message) => {
     if (projectItem) {
       let targetOptionId = "";
 
-      // Maps labels to your 4 Option IDs
-      if (labelInput.includes("done review (weekday)")) targetOptionId = process.env.OPTION_ID_REVIEW_FOUNDER;
-      else if (labelInput.includes("bug")) targetOptionId = process.env.OPTION_ID_TODO;
-      else if (labelInput.includes("weekday")) targetOptionId = process.env.OPTION_ID_REVIEW;
-      else if (labelInput.includes("weekend")) targetOptionId = process.env.OPTION_ID_DONE;
+      // --- YOUR NEW CUSTOM LABEL LOGIC ---
+      if (labelInput.includes("bug") || labelInput.includes("improvement")) {
+        targetOptionId = process.env.OPTION_ID_TODO.trim(); // Move to To-Do
+      } 
+      else if (labelInput.includes("done review (weekday)")) {
+        targetOptionId = process.env.OPTION_ID_REVIEW_FOUNDER.trim(); // Move to In review (Founders)
+      } 
+      else if (labelInput.includes("done review (weekend)")) {
+        targetOptionId = process.env.OPTION_ID_DONE.trim(); // Move to Done
+      }
 
       if (targetOptionId) {
         const moveMutation = `
@@ -152,12 +155,12 @@ client.on('messageCreate', async (message) => {
         await queryGitHub(moveMutation, {
           projectId: projectItem.project.id,
           itemId: projectItem.id,
-          fieldId: process.env.STATUS_FIELD_ID.trim(), // .trim() removes invisible spaces
-          optionId: targetOptionId.trim()              // .trim() removes invisible spaces
+          fieldId: process.env.STATUS_FIELD_ID.trim(),
+          optionId: targetOptionId
         });
       }
     } else {
-      console.log("❌ Could not find this PR (or its linked Issue) attached to the Project Board.");
+      console.log("❌ Card not found on the Zlice Master Engine board.");
     }
 
     message.reply(`✅ **Engine Sync Complete**\n- Comment added\n- Label **${labelInput}** applied\n- Board card moved.`);
