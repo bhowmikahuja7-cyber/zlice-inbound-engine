@@ -152,8 +152,8 @@ client.on('messageCreate', async (message) => {
         await queryGitHub(moveMutation, {
           projectId: projectItem.project.id,
           itemId: projectItem.id,
-          fieldId: process.env.STATUS_FIELD_ID,
-          optionId: targetOptionId
+          fieldId: process.env.STATUS_FIELD_ID.trim(), // .trim() removes invisible spaces
+          optionId: targetOptionId.trim()              // .trim() removes invisible spaces
         });
       }
     } else {
